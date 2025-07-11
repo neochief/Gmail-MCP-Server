@@ -25,6 +25,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
 const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
+const MAPPING_TO_EMAIL_METADATA = {
+    id: 'ID',
+    subject: 'Subject',
+    from: 'From',
+    to: 'To',
+    date: 'Date',
+} as const;
 
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
@@ -206,7 +213,10 @@ const ReadEmailSchema = z.object({
 
 const SearchEmailsSchema = z.object({
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
-    maxResults: z.number().optional().describe("Maximum number of results to return"),
+    // Gmail's maxResult max is 500, but that never fit the token limit, so take 200 as a reasonable limit.
+    maxResults: z.number().max(200).optional().describe("Maximum number of results to return per page"),
+    pageToken: z.string().optional().describe("Token for retrieving the next page of results (obtained from previous search response)"),
+    metadataToReturn: z.array(z.enum(['subject', 'date', 'to', 'from'])).optional().describe("Metadata fields to show in search results besides message ID (limit to only what you need to reduce output size)"),
 });
 
 // Updated schema to include removeLabelIds
@@ -310,7 +320,7 @@ async function main() {
             },
             {
                 name: "search_emails",
-                description: "Searches for emails using Gmail search syntax",
+                description: "Searches for emails using Gmail search syntax. Returns nextPageToken if more results can be loaded. Use it in pageToken to get remaining pages. Multiple requests may be needed to get all results.",
                 inputSchema: zodToJsonSchema(SearchEmailsSchema),
             },
             {
@@ -597,38 +607,84 @@ async function main() {
 
                 case "search_emails": {
                     const validatedArgs = SearchEmailsSchema.parse(args);
-                    const response = await gmail.users.messages.list({
+                    
+                    const apiParams: any = {
                         userId: 'me',
                         q: validatedArgs.query,
                         maxResults: validatedArgs.maxResults || 10,
-                    });
+                    };
+                    
+                    if (validatedArgs.pageToken) {
+                        apiParams.pageToken = validatedArgs.pageToken;
+                    }
+
+                    const metadataToReturn = validatedArgs.metadataToReturn || [];
+
+                    const response = await gmail.users.messages.list(apiParams);
 
                     const messages = response.data.messages || [];
                     const results = await Promise.all(
                         messages.map(async (msg) => {
+                            const requiredMetadata = metadataToReturn.map(field => MAPPING_TO_EMAIL_METADATA[field]);
                             const detail = await gmail.users.messages.get({
                                 userId: 'me',
                                 id: msg.id!,
                                 format: 'metadata',
-                                metadataHeaders: ['Subject', 'From', 'Date'],
+                                metadataHeaders: requiredMetadata,
                             });
                             const headers = detail.data.payload?.headers || [];
-                            return {
+
+                            const result = {
                                 id: msg.id,
-                                subject: headers.find(h => h.name === 'Subject')?.value || '',
-                                from: headers.find(h => h.name === 'From')?.value || '',
-                                date: headers.find(h => h.name === 'Date')?.value || '',
-                            };
+                            } as Record<keyof typeof MAPPING_TO_EMAIL_METADATA, string>;
+
+                            metadataToReturn.forEach((field) => {
+                                const metadataField = MAPPING_TO_EMAIL_METADATA[field];
+                                result[field] = headers.find(h => h.name === metadataField)?.value || '';
+                            });
+
+                            return result;
                         })
                     );
+
+                    // Build pagination info
+                    const paginationInfo = [];
+                    const totalEstimate = response.data.resultSizeEstimate;
+
+                    if (response.data.nextPageToken) {
+                        if (totalEstimate !== undefined) {
+                            // Give smart guidance based on result size
+                            const currentMaxResults = validatedArgs.maxResults || 10;
+                            if (totalEstimate && currentMaxResults < 200) {
+                                const estimatedPages = Math.ceil(totalEstimate / currentMaxResults);
+                                if (estimatedPages >= 3) {
+                                    const suggestedMaxResults = Math.min(200, totalEstimate);
+                                    paginationInfo.push(`Efficiency tip: use maxResults:${suggestedMaxResults} for optimal pagination to get further pages.`);
+                                }
+                            }
+                        }
+                        paginationInfo.push(`Next page token: ${response.data.nextPageToken}`);
+                    } else {
+                        paginationInfo.push('No more pages available. All results retrieved.');
+                    }
+
+                    // Format output with results and pagination info
+                    const resultText = results.map(r => {
+                        const strings = [] as string[];
+                        const keys = Object.keys(r) as (keyof typeof MAPPING_TO_EMAIL_METADATA)[];
+                        keys.forEach((key) => {
+                            strings.push(`${MAPPING_TO_EMAIL_METADATA[key]}: ${r[key]}`);
+                        });
+                        return strings.join("\n");
+                    }).join('\n\n');
+                    
+                    const paginationText = paginationInfo.length > 0 ? `\n\nPagination Info:\n${paginationInfo.join('\n')}` : '';
 
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: results.map(r =>
-                                    `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\n`
-                                ).join('\n'),
+                                text: `Found ${messages.length} messages on this page.${paginationText}\n\n${resultText}`,
                             },
                         ],
                     };
